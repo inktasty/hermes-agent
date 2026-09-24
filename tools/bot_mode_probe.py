@@ -18,6 +18,20 @@ import threading
 from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
+# The desk contract every Bot Chat carries: place long work off-thread and report it, re-check
+# facts after a silence, and keep anything durable out of the process. Held in a named constant
+# (not inlined in ``_build_section``) so the text is one seam — the same-process regression test
+# edits it to prove the rebuild path force-refreshes the cached section (``_cached``).
+_DESK_CONTRACT = (
+    "Place work, do not hold the chat. If a job will outlive this turn, dispatch it now and "
+    "keep the conversation responsive.\n"
+    "Report on your own. When a dispatched job lands, post the outcome and the artifact, "
+    "unprompted, in one or two lines.\n"
+    "Check before you trust. When the gap between messages was long, re-verify anything that "
+    "can have changed before answering from memory.\n"
+    "Anything that must survive a restart goes to a card or a scheduled job, never a "
+    "background child.\n"
+)
 # The legacy section through the next H2 heading (or EOF), plus the blank lines before it.
 _LEGACY_PROTOCOL_RE = re.compile(r"\n*" + re.escape(_PROTOCOL_HEADING) + r"[ \t]*\n.*?(?=\n## |\Z)", re.S)
 
@@ -297,6 +311,7 @@ def _build_section(home: Path) -> str:
         "concisely via message_agent to their handle, and if it is a pure FYI "
         "with nothing to add, staying silent is fine — never ping-pong "
         "acknowledgements.\n"
+        f"{_DESK_CONTRACT}"
         f"You are `@{_handle(me)}`. Your teammates (live roster; roles from their "
         "profiles):\n"
         f"{roster_block}"
@@ -389,7 +404,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         surface["roster"] = []
     # Protocol-text version salt: bumping it refreshes every eternal Bot Chat
     # prompt ONCE so existing bots adopt a new protocol section.
-    surface["protocol_version"] = 2
+    surface["protocol_version"] = 3
     # Peer gateways and the Desktop relay roster are part of the messaging
     # surface too: registering a peer or (dis)connecting a machine must show up.
     surface["peers"] = _peers(root)

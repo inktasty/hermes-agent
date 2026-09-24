@@ -8,6 +8,7 @@ modules keep their own subclass (logger name, disk-watch hooks) on top of it.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,43 @@ def stamp_default_user_agent(request):
     if "user-agent" not in request.headers:
         request.headers["User-Agent"] = DEFAULT_AUTH_REQUEST_USER_AGENT
     return request
+
+
+# Authorization servers that reject a dynamic client registration whose metadata carries ``scope``
+# ("invalid_client_metadata: Requested scopes are invalid or not supported" - Indeed, whose
+# registration endpoint rejects the very scopes its own metadata advertises and its authorization
+# endpoint accepts). RFC 7591 makes ``scope`` optional at registration, so the field is dropped for
+# that registration endpoint only; the authorization URL the SDK builds still asks for the
+# discovery-advertised scopes, which is where the grant is decided.
+_DCR_SCOPE_REJECTING_HOSTS = frozenset({"secure.indeed.com"})
+
+
+def drop_rejected_registration_scope(request):
+    """Drop ``scope`` from a dynamic client registration request for authorization servers that
+    reject it; every other SDK-built request (metadata fetch, token exchange) passes through."""
+    try:
+        parts = urlsplit(str(request.url))
+        if (request.method.upper() != "POST"
+                or (parts.hostname or "").lower() not in _DCR_SCOPE_REJECTING_HOSTS
+                or not parts.path.rstrip("/").endswith("/register")):
+            return request
+        payload = json.loads(request.content.decode("utf-8"))
+        if not isinstance(payload, dict) or "scope" not in payload:
+            return request
+        payload.pop("scope")
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        # Mutate in place: the request was built by whatever HTTP library the SDK is bound to
+        # (httpx2 in this install), so rebuilding it here would need that same library.
+        request.stream = type(request.stream)(data)
+        request._content = data  # noqa: SLF001 - httpx caches the body for ``.content``
+        if "content-length" in request.headers:
+            request.headers["Content-Length"] = str(len(data))
+        logger.info("MCP OAuth: dropped request-scope from client registration with %s "
+                    "(that authorization server rejects the field)", parts.hostname)
+        return request
+    except Exception:  # the fixup must never be the thing that breaks a login
+        logger.debug("MCP OAuth: could not adjust the client registration request", exc_info=True)
+        return request
 
 
 def _asm_discovery_failure(response) -> str | None:
@@ -263,6 +301,7 @@ class HermesProviderMixin:
                         raise
                     if out is not request:
                         stamp_default_user_agent(out)
+                        out = drop_rejected_registration_scope(out)
                     # Full bidirectional delegation: the SDK drives this flow with
                     # asend(response), so `async for` would swallow the response and
                     # feed the inner generator None. Async generators have no
