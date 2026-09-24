@@ -612,7 +612,7 @@ export let serverInjectsProtocol = false
  *  multi-source merge and the roster query stamp on afterwards. Not in
  *  types.ts: this is the query-cache envelope around RosterRow, not a domain
  *  object. */
-interface RosterSnapshot {
+export interface RosterSnapshot {
   /** Newer backends inject the teammate protocol into the system prompt. */
   bot_mode_protocol?: boolean
   /** Time the request was ISSUED, the conservative bound mergeServerMeta wants. */
@@ -756,6 +756,34 @@ export async function primeRoster(): Promise<void> {
     })
   } catch {
     /* offline or older build — readers keep their existing fallbacks */
+  }
+}
+
+/** Force a FRESH roster snapshot into the shared query cache, bypassing
+ *  `primeRoster`'s 5 s staleTime. Clear chat needs this: it retires one
+ *  canonical chat and mints another, and both `createCanonicalChat`'s
+ *  fail-closed registry check and the `/new` → `/compact` guard read
+ *  `canonical_session` off the roster, so a cached snapshot would either
+ *  refuse the mint or leave the guard pointing at the archived row.
+ *
+ *  Returns the snapshot it loaded, or null when the read FAILED (offline, a
+ *  hiccup, an older build). Never throws, but the failure is no longer silent:
+ *  Clear chat's post-mint verification is load-bearing, so a caller that needs
+ *  proof must be able to tell "refreshed to X" from "could not refresh". */
+export async function refreshRoster(): Promise<RosterSnapshot | null> {
+  const connectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
+
+  try {
+    const snapshot = await queryClient.fetchQuery<RosterSnapshot>({
+      queryKey: [...ROSTER_KEY, connectionId],
+      queryFn: () => fetchRosterSnapshot(connectionId),
+      staleTime: 0
+    })
+
+    return snapshot ?? null
+  } catch {
+    /* offline or older build — the caller keeps its existing fallbacks */
+    return null
   }
 }
 

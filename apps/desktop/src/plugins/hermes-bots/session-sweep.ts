@@ -10,6 +10,7 @@
 import { host } from '@hermes/plugin-sdk'
 
 import { PROFILE_SESSION_LIST_LIMIT } from './canonical-chat'
+import { isArchivedBotChat } from './clear-chat'
 import { $lastRoster } from './data'
 import { $groupChats, updateGroupChat } from './group-chat'
 import { groupMemberKey, groupSessionMemberKey } from './group-membership'
@@ -268,6 +269,12 @@ function isBotModeSweepCandidate(row: SweepSessionRow | null | undefined, nowSec
   return (
     row &&
     row.id &&
+    // Clear chat's archived rows are never swept back to hidden: they are the
+    // visible history of a bot's retired chat. The rename already takes them
+    // out of title-based ownership; this is the id-based backstop for the
+    // lineage case where the durable root still carries the plumbing title
+    // while the tip (the row Clear chat renamed) carries the archive stamp.
+    !isArchivedBotChat(row.id) &&
     isBotModeSweepTitle(row.title) &&
     Number.isFinite(startedAt) &&
     startedAt > 0 &&

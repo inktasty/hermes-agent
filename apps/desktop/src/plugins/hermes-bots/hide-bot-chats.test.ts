@@ -50,6 +50,13 @@ vi.mock('@hermes/plugin-sdk', () => ({ host: hostMock }))
 
 vi.mock('./canonical-chat', () => ({ PROFILE_SESSION_LIST_LIMIT: 200 }))
 
+// Clear chat's archived rows. The sweep asks this per candidate row id; the
+// test file drives the sweep through the scheduler, so the module the sweep
+// imports is stubbed here rather than exercised (clear-chat.test.ts covers it).
+const { archivedIds } = vi.hoisted(() => ({ archivedIds: new Set<string>() }))
+
+vi.mock('./clear-chat', () => ({ isArchivedBotChat: (id: string) => archivedIds.has(id) }))
+
 vi.mock('./data', () => ({ $lastRoster: { get: () => lastRoster.value } }))
 
 vi.mock('./group-chat', () => ({
@@ -109,6 +116,7 @@ beforeEach(() => {
   vi.setSystemTime(1_000_000)
   groupChats.value = {}
   lastRoster.value = []
+  archivedIds.clear()
   hostMock.listPersistedSessions.mockResolvedValue({ sessions: [] })
   hostMock.setPersistedSessionHidden.mockResolvedValue(undefined)
   hostMock.request.mockResolvedValue({})
@@ -271,6 +279,24 @@ describe('the title half: each roster bot’s own profile listing', () => {
     expect(hiddenCalls().every(([, options]) => options.hidden)).toBe(true)
     // Remote-source rows keep their immutable source owner on the REST route.
     expect(hiddenCalls().find(([, options]) => options.sessionId === 'r-1')?.[0]?.connectionId).toBe('mini')
+  })
+
+  it('leaves Clear chat’s archived rows visible', async () => {
+    // An archived bot chat keeps a plumbing-shaped identity in the lineage
+    // case (the durable root still carries "Bot Chat" while the renamed tip
+    // carries the archive stamp), and it is meant to be readable history — the
+    // sweep must never push it back to hidden.
+    archivedIds.add('a-1')
+
+    await runSweep()
+
+    expect(hiddenCalls().map(([, options]) => options.sessionId)).not.toContain('a-1')
+    // Everything else the title half owns is untouched by the skip.
+    expect(
+      hiddenCalls()
+        .map(([, options]) => options.sessionId)
+        .sort()
+    ).toEqual(['a-2', 'a-3', 'a-8', 'r-1'])
   })
 
   it('runs beside the id half, and a throwing title sweep never breaks it', async () => {

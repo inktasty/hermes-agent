@@ -22,6 +22,7 @@ import {
   LocalizedTabTitle,
   PALETTE_AREA,
   SIDEBAR_PROFILE_GROUP_HEADER_AREA,
+  TITLEBAR_AREAS,
   translateNow
 } from '@hermes/plugin-sdk'
 import type { ChatEmptyProps, PluginContext, ProfileGroupRoute } from '@hermes/plugin-sdk'
@@ -39,6 +40,8 @@ import {
 } from './bot-state'
 import { isCanonicalChatOnScreen, openBotCanonicalChat } from './canonical-chat'
 import { BotChatEmpty } from './chat-empty'
+import { hydrateArchivedBotChats, isArchivedBotChat } from './clear-chat'
+import { ArchivedChatBanner, ClearChatAction } from './clear-chat-action'
 import { bindProfileSync, RoutinesPane } from './cron'
 import {
   $botMeta,
@@ -229,6 +232,19 @@ export default {
     // Bot Mode sessions are always hidden now — the old "hide Bot Chats"
     // pref is gone (its stored key is simply ignored). The reconciliation
     // sweep below hides any rows born visible under the old pref.
+
+    // Hydrate Clear chat's archive map. It is what keeps an archived bot chat
+    // read-only across a window reload: the row itself is an ordinary visible
+    // session (core stores no flag for it), so the plugin's own record is the
+    // only thing that knows the composer must stay suppressed.
+    try {
+      // @ts-expect-error TODO(bot-mode-types): PluginStorage.get requires a fallback argument.
+      Promise.resolve(ctx.storage?.get?.('archived-bot-chats-v1'))
+        .then(value => hydrateArchivedBotChats(value))
+        .catch(() => undefined)
+    } catch {
+      /* no storage — this window starts with no archived chats recorded */
+    }
 
     // Hydrate the activity-toast pref (default OFF).
     try {
@@ -744,8 +760,22 @@ export default {
       id: 'mention-middleware',
       area: COMPOSER_AREAS.middleware,
       data: {
-        handler: async (draft: ComposerDraftPayload): Promise<ComposerDraftPayload> => {
+        handler: async (draft: ComposerDraftPayload): Promise<ComposerDraftPayload | null> => {
           const text = draft.text || ''
+
+          // An archived bot chat is read-only. Clear chat renamed that row and
+          // minted the fresh one; a completion addressed to it would land in a
+          // conversation the bot has stopped reading, and there is no resume
+          // path back. Cancelling the send (returning null) is the plugin's
+          // whole reach over the composer — core owns the input and the submit
+          // engine — so the archived row reads as history rather than as a
+          // chat that can be continued. The composer.top banner says the same
+          // thing before the user types.
+          if (isArchivedBotChat(host.state.focusedStoredSessionId.get())) {
+            host.notify({ kind: 'info', message: ctx.i18n.t('clearChat.archivedNotice') })
+
+            return null
+          }
 
           // /new inside a bot's canonical forever-chat would fork the
           // relationship into a scratch session — the one thing Bots mode
@@ -872,6 +902,26 @@ export default {
           }
         }
       }
+    })
+
+    // Clear chat: one action in the bot chat's header. It renders null unless a
+    // bot's canonical chat is the session on screen, so it never appears in
+    // Sessions mode or on another profile's chat. The titlebar right cluster is
+    // the header band's action zone — the chat header itself is core-owned and
+    // has no plugin slot.
+    ctx.register({
+      id: 'clear-chat-action',
+      area: TITLEBAR_AREAS.right,
+      render: () => <ClearChatAction />
+    })
+
+    // The archived row's stand-in for a composer: it can be read, never
+    // continued. Mounted for every chat, resolves to null for all but the rows
+    // Clear chat retired.
+    ctx.register({
+      id: 'archived-chat-banner',
+      area: COMPOSER_AREAS.top,
+      render: () => <ArchivedChatBanner />
     })
   }
 }

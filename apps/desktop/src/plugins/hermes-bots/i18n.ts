@@ -469,6 +469,25 @@ type BotsMessages = {
     runsRaw: string
     timesTotal: (count: number) => string
   }
+
+  /** "Clear chat": archiving a bot's canonical chat and minting a fresh one.
+   *  The four `blocked*` strings are the action's disabled reason — the
+   *  in-flight work it refuses to strand. */
+  clearChat: {
+    action: string
+    checking: string
+    blockedTurn: string
+    blockedSubagent: (count: string) => string
+    blockedProcess: (count: string) => string
+    blockedCard: (count: string) => string
+    blockedUnverified: string
+    failed: string
+    failedDetail: string
+    unconfirmed: string
+    archivedNotice: string
+    archivedRowTitle: (bot: string, stamp: string) => string
+    cleared: (bot: string) => string
+  }
 }
 
 const en: BotsMessages = {
@@ -892,6 +911,21 @@ const en: BotsMessages = {
     runsInterval: (count, unit) => `Runs every ${count} ${unit}`,
     runsRaw: 'Raw schedule — every Nm/Nh/Nd or 5-field cron',
     timesTotal: count => `, ${count} time(s) total`
+  },
+  clearChat: {
+    action: 'Clear chat',
+    checking: 'Checking for work in flight…',
+    blockedTurn: 'A turn is running in this chat — wait for it to finish.',
+    blockedSubagent: count => `${count} background child task(s) still running — wait for them to land.`,
+    blockedProcess: count => `${count} background process(es) still running — wait for them to finish.`,
+    blockedCard: count => `${count} kanban card(s) still open for this chat — wait for them to land.`,
+    blockedUnverified: 'Clear chat can’t check this bot for work in flight right now — try again in a moment.',
+    failed: 'Could not archive this chat',
+    failedDetail: 'Reopen the chat and try again.',
+    unconfirmed: 'The chat was archived, but the app could not confirm the new one. Reopen the bot from the Bots pane before sending.',
+    archivedNotice: 'This chat is archived — it can’t be continued. Open the bot for a fresh chat.',
+    archivedRowTitle: (bot, stamp) => `Bot Chat · ${bot} — archived ${stamp}`,
+    cleared: bot => `${bot}’s chat was archived — a fresh chat is open.`
   }
 }
 
@@ -1320,6 +1354,21 @@ const ja: BotsMessages = {
     runsInterval: (count, unit) => `${count}${unit}ごとに実行します`,
     runsRaw: '生のスケジュール — Nm/Nh/Nd または5フィールドのcron',
     timesTotal: count => `、合計${count}回`
+  },
+  clearChat: {
+    action: 'チャットをクリア',
+    checking: '進行中の作業を確認しています…',
+    blockedTurn: 'このチャットでターンが実行中です — 終了を待ってください。',
+    blockedSubagent: count => `バックグラウンドの子タスクが${count}件実行中です — 完了を待ってください。`,
+    blockedProcess: count => `バックグラウンドのプロセスが${count}件実行中です — 終了を待ってください。`,
+    blockedCard: count => `このチャット宛てのカンバンカードが${count}件未完了です — 完了を待ってください。`,
+    blockedUnverified: 'このボットに進行中の作業がないか確認できませんでした — しばらくしてからもう一度お試しください。',
+    failed: 'このチャットをアーカイブできませんでした',
+    failedDetail: 'チャットを開き直して、もう一度お試しください。',
+    unconfirmed: 'チャットはアーカイブしましたが、新しいチャットを確認できませんでした。送信する前に Bots ペインからボットを開き直してください。',
+    archivedNotice: 'このチャットはアーカイブ済みです — 続けることはできません。新しいチャットはボットから開いてください。',
+    archivedRowTitle: (bot, stamp) => `Bot Chat · ${bot} — アーカイブ ${stamp}`,
+    cleared: bot => `${bot} のチャットをアーカイブしました — 新しいチャットを開きました。`
   }
 }
 
@@ -1733,6 +1782,21 @@ const zh: BotsMessages = {
     runsInterval: (count, unit) => `每 ${count} ${unit}运行`,
     runsRaw: '原始计划 — every Nm/Nh/Nd 或 5 段 cron',
     timesTotal: count => `，共 ${count} 次`
+  },
+  clearChat: {
+    action: '清空聊天',
+    checking: '正在检查进行中的工作…',
+    blockedTurn: '此聊天中有回合正在运行 — 请等待其结束。',
+    blockedSubagent: count => `还有 ${count} 个后台子任务在运行 — 请等待其完成。`,
+    blockedProcess: count => `还有 ${count} 个后台进程在运行 — 请等待其结束。`,
+    blockedCard: count => `此聊天还有 ${count} 张未完成的看板卡片 — 请等待其结束。`,
+    blockedUnverified: '无法确认该机器人当前没有进行中的工作 — 请稍后重试。',
+    failed: '无法归档此聊天',
+    failedDetail: '请重新打开聊天后再试。',
+    unconfirmed: '聊天已归档，但应用无法确认新聊天。发送前请从 Bots 面板重新打开该机器人。',
+    archivedNotice: '此聊天已归档 — 无法继续。请从机器人打开新的聊天。',
+    archivedRowTitle: (bot, stamp) => `Bot Chat · ${bot} — 已归档 ${stamp}`,
+    cleared: bot => `已归档 ${bot} 的聊天 — 新聊天已打开。`
   }
 }
 
@@ -2146,6 +2210,21 @@ const zhHant: BotsMessages = {
     runsInterval: (count, unit) => `每 ${count} ${unit}執行`,
     runsRaw: '原始排程 — every Nm/Nh/Nd 或 5 段 cron',
     timesTotal: count => `，共 ${count} 次`
+  },
+  clearChat: {
+    action: '清除聊天',
+    checking: '正在檢查進行中的工作…',
+    blockedTurn: '此聊天中有回合正在執行 — 請等待其結束。',
+    blockedSubagent: count => `還有 ${count} 個背景子任務在執行 — 請等待其完成。`,
+    blockedProcess: count => `還有 ${count} 個背景程序在執行 — 請等待其結束。`,
+    blockedCard: count => `此聊天還有 ${count} 張未完成的看板卡片 — 請等待其結束。`,
+    blockedUnverified: '無法確認該機器人目前沒有進行中的工作 — 請稍後再試。',
+    failed: '無法封存此聊天',
+    failedDetail: '請重新開啟聊天後再試。',
+    unconfirmed: '聊天已封存，但應用程式無法確認新聊天。傳送前請從 Bots 面板重新開啟該機器人。',
+    archivedNotice: '此聊天已封存 — 無法繼續。請從機器人開啟新的聊天。',
+    archivedRowTitle: (bot, stamp) => `Bot Chat · ${bot} — 已封存 ${stamp}`,
+    cleared: bot => `已封存 ${bot} 的聊天 — 新聊天已開啟。`
   }
 }
 
