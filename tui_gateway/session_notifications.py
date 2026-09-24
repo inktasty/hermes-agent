@@ -132,9 +132,9 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt.get("session_id", ""), evt_type, *(evt.get(f, 0 if f == "suppressed" else "") for f in extra))
 
 
-# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
-# past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+# Deliverable kinds only: a silent kind (archived/unblocked) has no formatter, and a claim moves the cursor to the
+# highest id it returns, so claiming one would only skip an event no turn ever carries.
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status")
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = _BOT_DELIVERY_POLL_SECONDS = 5.0
@@ -158,14 +158,19 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """``_run_prompt_submit`` for a claimed (running=True) turn; releases on failure.
+
+    Returns ``_run_prompt_submit``'s flag: a refusal is a delivery that never happened (it releases the turn
+    itself), so callers holding a claim must treat False like a raise and put the claim back.
+
+    The turn-start frame is NOT emitted here: ``_run_prompt_submit`` emits it after the turn is admitted.
+    A frame sent before admission is what leaves a refused delivery showing "the agent is working" for
+    good, since the client latches busy on that frame and no turn runs to send its end.
+    """
     try:
-        from gateway.warning_notifications import render_notification
         with _session_profile_runtime_scope(session):
-            render_notification(lambda: _emit("message.start", sid), platform="tui",
-                                diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+            return bool(_run_prompt_submit(rid, sid, session, text, **kwargs))
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -193,7 +198,11 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) 
                 mgr.abandon_tick()
                 return
             # Releases the claim on failure: the swallow below would otherwise leave the session busy for good.
-            _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
+            if _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed") is False:
+                # A refusal ran no turn: the tick stays due and the claim goes back.
+                _notif_release_turn(session)
+                with contextlib.suppress(Exception):
+                    mgr.abandon_tick()
             return
     except Exception:
         pass
@@ -291,8 +300,12 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
         else:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, wakeup)
+            # No turn-start frame before admission: _run_prompt_submit emits it once the turn is
+            # admitted, so a refused wakeup cannot leave the client showing work that never runs.
+            if _run_prompt_submit(rid, sid, session, wakeup) is False:
+                _notif_release_turn(session)
+                with contextlib.suppress(Exception):
+                    mgr.abandon_tick()
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
         _notif_release_turn(session)
@@ -352,74 +365,182 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
         return slug, f"slug:{slug}"
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
-    """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
-    writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
-    falls through so delivery is preserved)."""
+def _kb_sub_ident(sub: dict) -> dict:
+    """The four columns that identify one subscription row."""
+    return dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "")
+
+
+def _kb_event_is_diagnostic(ev) -> bool:
+    """Infrastructure attention (a crash, a timeout) vs. a task-status change, per the gateway's classifier."""
+    from gateway.kanban_watchers_notifier import diagnostic_event
+    return bool(diagnostic_event(ev))
+
+
+def _kb_claim_for_turn(_kbn, conn, sub_ident: dict, *, split: bool) -> tuple[int, int, list]:
+    """Claim the unseen events the turn this poll will deliver carries, as ``(old_cursor, new_cursor, events)``.
+
+    Without the split that is one atomic claim of every deliverable kind. With it the turn carries a single
+    presentation category — a diagnostic turn is muted when ``suppress_warning_notifications`` is on, so folding a
+    result into one would hide the report — and only the contiguous run of that category is claimed, capped at the
+    run's last event id in the same transaction that moves the cursor
+    (``claim_unseen_events_for_sub_bounded``).
+
+    The cap is what makes a narrowed claim safe. A kind-filtered claim reports ``max(id of the rows returned)``, so
+    the same kinds reappearing after the other category intervened would ride the cursor out of the stream unread;
+    the cap stops the claim at the run instead. Because the cap is part of the claim, there is no second cursor
+    move to confirm and no window for another consumer to move the row out from under one: ``new_cursor`` is always
+    the cursor the row holds afterwards, which is the value every later rewind CASes against. An event the claim
+    did not return is never retired, so a refused or raised turn can always put its claim back for the next tick.
+    """
+    if not split:
+        return _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
+    _cursor, unseen = _kbn.unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
+    if not unseen:
+        return 0, 0, []
+    want_diagnostic = _kb_event_is_diagnostic(unseen[0])
+    run: list = []
+    for ev in unseen:
+        if _kb_event_is_diagnostic(ev) != want_diagnostic:
+            break
+        run.append(ev)
+    # ``unseen`` is id-ordered and the run is its contiguous prefix, so every unseen event at or below the cap is in
+    # the run: the kind filter plus the cap returns exactly the run, and nothing above it is retired.
+    return _kbn.claim_unseen_events_for_sub_bounded(
+        conn, kinds=sorted({ev.kind for ev in run}), max_event_id=int(run[-1].id), **sub_ident)
+
+
+def _kb_poll_board(sid: str, _kb, slug: str, session_key: str, *, claim: bool, split: bool, ping,
+                   out: Optional[list] = None) -> list[dict]:
+    """One board's share of a poll: claim + format this session's unseen events, or (``claim=False``) read them
+    without advancing anything and render only the status lines that have not pinged yet.
+
+    One poller per live session: the board is not opened writable unless it has a subscription owned by this exact
+    session (a failed read-only probe — locked/corrupt DB — falls through so delivery is preserved). ``ping`` is
+    None when the caller wants the texts alone; otherwise it renders one line and returns whether it was visible.
+    Returned records carry the texts plus the cursor pair the caller needs to rewind a claim nothing delivered; a
+    record whose task is already archived additionally carries ``archived``, the flag that entitles the caller —
+    once, and only once, the submit is accepted — to retire the subscription.
+
+    A claim is registered in ``out`` the moment its cursor moves — before the task row is read and before any text
+    is formatted — because from that instant the only record of the owed report is the claim's own cursor pair.
+    Anything raising after it (task lookup, a formatter, a later board) must leave the board's committed claims
+    visible to a rewind, so the caller passes one accumulator across every board and rewinds it on the way out.
+    """
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli import kanban_db_notify as _kbn
+    from gateway.warning_notifications import DiagnosticText
+    claims: list = [] if out is None else out
     with contextlib.suppress(Exception):
         if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
-            return []
+            return claims
     try:
         conn = _kbc.connect(board=slug)
     except Exception:
-        return []
-    texts: list = []
+        return claims
     with contextlib.closing(conn):
         try:
             subs = _kbn.list_notify_subs(conn)
         except Exception:
-            return []
+            return claims
         for sub in subs:
             if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
                 continue
-            sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                             thread_id=sub.get("thread_id") or "")
-            _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
-            if not events:
-                continue
-            task = _kb.get_task(conn, sub["task_id"])
-            from gateway.kanban_watchers_notifier import diagnostic_event
-            from gateway.warning_notifications import DiagnosticText
+            sub_ident = _kb_sub_ident(sub)
+            record: Optional[dict] = None
+            if claim:
+                old_cursor, new_cursor, events = _kb_claim_for_turn(_kbn, conn, sub_ident, split=split)
+                if new_cursor > old_cursor:
+                    record = {"slug": slug, "sub": sub_ident, "old_cursor": old_cursor,
+                              "new_cursor": new_cursor, "texts": []}
+                    claims.append(record)
+                # The task row is read even when nothing was claimed: the archived check below is what retires a
+                # subscription whose only remaining event is the (silent, unclaimed) archive itself.
+                task = _kb.get_task(conn, sub["task_id"])
+                # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub
+                # lets a later reopen notify the same session. The claimed cursor prevents replay.
+                if task and getattr(task, "status", "") == "archived":
+                    if record is None:
+                        # Nothing owed to a turn, so the archive retires the route right here (this is also what
+                        # retires a sub whose only remaining event was the silent, unclaimed archive itself).
+                        with contextlib.suppress(Exception):
+                            _kbn.remove_notify_sub(conn, **sub_ident)
+                    else:
+                        # A report is claimed but no turn carries it yet, and the claim's cursor pair is the only
+                        # record of it: the row must outlive the submit, or a refusal/raise rewinds a sub that is
+                        # already gone and the report is lost with no route left to retry on. Flagged for the
+                        # caller, which retires it once the report is accepted.
+                        record["archived"] = True
+            else:
+                old_cursor = new_cursor = 0
+                _cursor, events = _kbn.unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
+                if not events:
+                    continue
+                task = _kb.get_task(conn, sub["task_id"])
+            texts: list = []
             for ev in events:
                 text = _format_kanban_event_text(sub, task, ev, slug)
-                if text:
-                    texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
-            # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
-            # later reopen notify the same session. The claimed cursor prevents replay.
-            if task and getattr(task, "status", "") == "archived":
-                with contextlib.suppress(Exception):
-                    _kbn.remove_notify_sub(conn, **sub_ident)
-    return texts
+                if text is None:
+                    continue
+                wrapped = DiagnosticText(text) if _kb_event_is_diagnostic(ev) else text
+                texts.append(wrapped)
+                if ping is None or int(ev.id) <= int(sub.get("last_ping_event_id") or 0):
+                    continue
+                if ping(wrapped, isinstance(wrapped, DiagnosticText)):
+                    # Checkpoint the ping apart from the cursor: a busy session re-reads the same unclaimed events
+                    # every poll, and the line must not re-fire each time.
+                    with contextlib.suppress(Exception):
+                        _kbn.record_notify_ping(conn, event_id=int(ev.id), **sub_ident)
+            if record is not None:
+                if texts:
+                    record["texts"] = texts
+                else:
+                    # Claimed, yet no line to carry (a kind without a formatter slipped in): hand the cursor back
+                    # here rather than let a turn that will never run retire the events.
+                    claims.remove(record)
+                    _notif_rewind_claims([record])
+    return claims
 
 
-def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
-    auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
-    delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
+def _collect_kanban_claims(sid: str, session: dict, *, claim: bool = True, split: bool = False, ping=None) -> list[dict]:
+    """Poll every board for this session's ``platform="tui"`` subscriptions (``kanban_create`` auto-subscribes with
+    ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the delivery path). Claiming
+    is the same atomic cursor move the gateway notifier makes: exactly-once even if a gateway polls the same DB.
+
+    Every claim this returns is a report still owed to a turn. No other exit leaves a cursor advanced: the boards
+    share one accumulator, so a failure in a task lookup, a formatter or a later board rewinds everything committed
+    so far — partial results included — before the exception escapes.
 
     See #59890.
     """
+    claims: list = []
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
-        return []
+        return claims
     try:
         from hermes_cli import kanban_db as _kb
     except Exception:
-        return []
+        return claims
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         try:
             boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
         except Exception:
-            return []
+            return claims
     # dict keyed by resolved DB identity: first slug per DB wins (a pinned HERMES_KANBAN_DB aliases slugs).
     unique = {}
     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
         unique.setdefault(resolved, slug)
-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
+    try:
+        for slug in unique.values():
+            _kb_poll_board(sid, _kb, slug, session_key, claim=claim, split=split, ping=ping, out=claims)
+    except Exception:
+        # A claim is already a durable cursor move: put every one of them back before the exception escapes, or the
+        # batch — including the boards that succeeded before the failure — is gone with nothing left to retry.
+        _notif_rewind_claims(claims)
+        raise
+    return claims
 
 
 def _notif_poll_kanban(sid: str, session: dict) -> None:
@@ -427,33 +548,103 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
         _notif_poll_kanban_scoped(sid, session)
 
 
+def _notif_rewind_claims(claims: list) -> None:
+    """Hand one undelivered batch's claims back: no turn carried them, so the next tick must find them again.
+
+    ``force_rewind_notify_cursor``, not the CAS-guarded ``rewind_notify_cursor``: a concurrent consumer that
+    advanced the subscription row past our claim would make the guarded rewind decline, and the events we never
+    delivered would stay retired behind the advanced cursor, where no later tick reads them. The forced rewind
+    reads the row's current cursor inside one transaction and CASes against that, so the claim's range becomes
+    claimable again; re-delivering a range that consumer claimed in between is the accepted price (at-least-once
+    over silent loss). A row that is gone or already at ``old_cursor`` leaves nothing to move, and is reported.
+    """
+    from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli import kanban_db_notify as _kbn
+    for claim in claims:
+        try:
+            conn = _kbc.connect(board=claim["slug"])
+        except Exception as exc:
+            _notif_log_failure("kanban notification rewind failed", exc)
+            continue
+        with contextlib.closing(conn):
+            try:
+                if not _kbn.force_rewind_notify_cursor(conn, claimed_cursor=claim["new_cursor"],
+                                                       old_cursor=claim["old_cursor"], **claim["sub"]):
+                    print(f"[tui_gateway] kanban notification rewind moved nothing "
+                          f"({claim['slug']}/{claim['sub'].get('task_id')})", file=sys.stderr)
+            except Exception as exc:
+                _notif_log_failure("kanban notification rewind failed", exc)
+
+
+def _notif_retire_archived_claims(claims: list) -> None:
+    """Retire the routes of accepted claims whose task is archived.
+
+    Called only after ``_notif_submit`` reports the report accepted. Archiving must not retire a report the turn
+    never delivered: the claim's cursor pair is the only record of it, so the subscription is kept until this
+    point — and a refused or raised submit never reaches here, it rewinds the claim and lets the next tick find
+    the report again in the row that is still there.
+    """
+    from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli import kanban_db_notify as _kbn
+    for claim in claims:
+        if not claim.get("archived"):
+            continue
+        try:
+            conn = _kbc.connect(board=claim["slug"])
+        except Exception as exc:
+            _notif_log_failure("kanban notification unsubscribe failed", exc)
+            continue
+        with contextlib.closing(conn):
+            with contextlib.suppress(Exception):
+                _kbn.remove_notify_sub(conn, **claim["sub"])
+
+
 def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
-    """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
-    cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
-    try:
-        texts = _collect_kanban_notifications(session)
-    except Exception as exc:
-        _notif_log_failure("kanban notification poll failed", exc)
-        texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
-    if not session.get("_kanban_pending") or not _notif_claim_turn(session):
+    """One kanban poll: turn first, then claim, then submit — the turn is held across the whole sequence, so no
+    prompt interleaves and the events this turn claims are exactly the ones it carries.
+
+    While the session is busy nothing is claimed: the unclaimed cursor IS the buffer, so a report survives a chat
+    that closes or a process that dies, and only the status lines that have not pinged yet are rendered. A submit
+    that raises or is refused rewinds its claim, so the next tick retries the report instead of dropping it."""
+    from gateway.warning_notifications import DiagnosticText, render_notification, warning_notifications_enabled
+
+    def ping(text, diagnostic: bool) -> bool:
+        return render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
+                                   platform="tui", diagnostic=diagnostic)
+
+    if not _notif_claim_turn(session):
+        try:
+            _collect_kanban_claims(sid, session, claim=False, ping=ping)
+        except Exception as exc:
+            _notif_log_failure("kanban notification poll failed", exc)
         return
-    with session["history_lock"]:
-        pending = session.get("_kanban_pending") or []
-        from gateway.warning_notifications import DiagnosticText, warning_notifications_enabled
-        split = not warning_notifications_enabled("tui")
-        diagnostic = split and isinstance(pending[0], DiagnosticText)
-        batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-        session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    try:
+        claims = _collect_kanban_claims(sid, session, claim=True,
+                                        split=not warning_notifications_enabled("tui"), ping=ping)
+    except Exception as exc:
+        # Collection rewinds the claims it committed before raising, so there is nothing left to hand back.
+        _notif_log_failure("kanban notification poll failed", exc)
+        claims = []
+    texts = [text for claim in claims for text in claim["texts"]]
+    if not texts:
+        _notif_release_turn(session)
+        return
+    # One category per turn: a muted (diagnostic) turn must never carry a report the user asked to see.
+    diagnostic = all(isinstance(text, DiagnosticText) for text in texts)
+    try:
+        started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(texts),
+                                "kanban notification dispatch failed",
+                                **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    except Exception:
+        _notif_rewind_claims(claims)
+        return
+    if started is False:
+        # A refusal delivered nothing: release the turn (``_run_prompt_submit`` does too) and put the claim back.
+        _notif_release_turn(session)
+        _notif_rewind_claims(claims)
+        return
+    # The report is accepted, so an archived task may now retire its route; a refusal above never gets here.
+    _notif_retire_archived_claims(claims)
 
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
@@ -476,9 +667,16 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
+        return
+    if started is False:
+        # A refusal ran no turn: put the durable delivery back so the event replays, and release the
+        # claim the caller took for it (``_admit_prompt_turn`` clears the flag; this keeps the
+        # contract for any other refusal source).
+        release_event_delivery(evt, claim)
+        _notif_release_turn(session)
         return
     complete_event_delivery(evt, claim)
 

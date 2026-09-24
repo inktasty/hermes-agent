@@ -590,6 +590,9 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     # sends identical bytes. Distinct from note_turn_start's _inflight_turn_started, a
     # tripwire slot cleared at persist.
     agent._current_turn_timestamp = time.time()
+    # Bot Chat per-message time gate: re-resolved lazily on this turn's first render
+    # (see _bot_chat_time_enabled), so a config change applies on the next turn.
+    agent._bot_chat_time_enabled = None
 
     # Pre-turn connection health check: clean up dead TCP connections.
     if agent.api_mode != "anthropic_messages":
@@ -1180,6 +1183,133 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
+# ── Bot Chat per-message local time ──────────────────────────────────────────
+# A Bot Chat's prompt is deliberately timeless (agent/system_prompt.py drops the volatile date
+# line), so its wall-clock signal has to ride the messages themselves. Bot chats only, off
+# everywhere else: `bot_mode.message_timestamps.enabled` is a new key with this one read site —
+# the gateway's `gateway.message_timestamps.enabled` gate (gateway/run.py::
+# _message_timestamps_enabled) is consulted on gateway paths only and never reaches the desktop
+# or the TUI. Every byte rendered here derives from a row's OWN stored timestamp, never the
+# clock, so re-assembling the same transcript is byte-identical (prompt-cache safe).
+BOT_CHAT_GAP_THRESHOLD_SECONDS = 4 * 60 * 60
+
+
+def _bot_chat_session_title(agent: Any) -> str:
+    """The title the Bot Mode gates key on: the session hint first (the DB title lands after
+    turn 1), then the session store."""
+    title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+    if title:
+        return title
+    try:
+        sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+        if sdb and sid:
+            return str(sdb.get_session_title(sid) or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _bot_chat_message_timestamps_enabled(agent: Any) -> bool:
+    """``bot_mode.message_timestamps.enabled`` for this agent's OWN profile (default OFF):
+    absent key, unreadable config and any error all mean off. Never raises."""
+    try:
+        from pathlib import Path
+
+        from hermes_cli.config_effective import load_user_config_effective
+
+        try:
+            from agent.system_prompt import _agent_home
+
+            home = _agent_home(agent)
+        except Exception:
+            home = None
+        user_config = load_user_config_effective(Path(home) / "config.yaml" if home else None)
+        bot_cfg = user_config.get("bot_mode") if isinstance(user_config, dict) else None
+        message_timestamps = bot_cfg.get("message_timestamps") if isinstance(bot_cfg, dict) else None
+        if isinstance(message_timestamps, dict):
+            return bool(message_timestamps.get("enabled", False))
+        return bool(message_timestamps)  # bare ``message_timestamps: true`` shorthand
+    except Exception:
+        return False
+
+
+def _bot_chat_time_enabled(agent: Any) -> bool:
+    """Per-turn gate for the Bot Chat time prefix: the canonical ``Bot Chat`` title (same gate
+    as the protocol section) on a profile that opted in.
+
+    Memoized on the agent and invalidated at turn start (``_reset_per_turn_agent_state``), so a
+    config change applies on the next turn while every iteration of one turn reuses one answer.
+    Never raises."""
+    cached = getattr(agent, "_bot_chat_time_enabled", None)
+    if cached is None:
+        try:
+            from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+            cached = bool(
+                getattr(agent, "_bot_mode_protocol", True)
+                and _bot_chat_session_title(agent) == BOT_CHAT_TITLE
+                and _bot_chat_message_timestamps_enabled(agent)
+            )
+        except Exception:
+            cached = False
+        with suppress(Exception):
+            agent._bot_chat_time_enabled = cached
+    return bool(cached)
+
+
+def _bot_chat_gap_label(gap_seconds: float) -> str:
+    """``4h 5m`` / ``6h`` / ``45m`` — whole minutes, so the bytes cannot vary between runs."""
+    hours, minutes = divmod(int(gap_seconds // 60), 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    return f"{hours}h" if hours else f"{minutes}m"
+
+
+def _bot_chat_gap_line(previous_epoch: Optional[float], current_epoch: Optional[float]) -> str:
+    """Silence line for the CURRENT turn's message, or ``""``.
+
+    Both epochs are stored values — this row's and the most recent prior user row's — so the
+    line is byte-identical across every assembly of the same transcript. No baseline (the first
+    message of a chat, or nothing prior survived compaction) and gaps under
+    ``BOT_CHAT_GAP_THRESHOLD_SECONDS`` stay silent."""
+    if previous_epoch is None or current_epoch is None:
+        return ""
+    gap_seconds = current_epoch - previous_epoch
+    if gap_seconds < BOT_CHAT_GAP_THRESHOLD_SECONDS:
+        return ""
+    return f"[Gap: {_bot_chat_gap_label(gap_seconds)} since the previous message]"
+
+
+def _bot_chat_current_turn_gap_line(prior_messages: List[Any], current_message: Any) -> str:
+    """Gap line for this turn's new user message, derived from the two stored timestamps."""
+    from gateway.message_timestamps import coerce_message_timestamp
+
+    previous_epoch = None
+    for prior in reversed(prior_messages):
+        if isinstance(prior, dict) and prior.get("role") == "user":
+            previous_epoch = coerce_message_timestamp(prior.get("timestamp"))
+            break
+    return _bot_chat_gap_line(
+        previous_epoch, coerce_message_timestamp(current_message.get("timestamp"))
+    )
+
+
+def _render_bot_chat_user_content(
+    content: Any, timestamp: Any, *, gap_line: str = "", tz: Any = None
+) -> Any:
+    """Wire copy of one Bot Chat user message: exactly one local-time prefix, derived from the
+    row's own stored ``timestamp`` (never the clock), plus this turn's gap line. The shared
+    render helper strips an existing prefix first, so a row that already carries one (a
+    messaging surface that stamps its own) is not double-stamped. Non-string (multimodal)
+    content passes through untouched."""
+    if not isinstance(content, str):
+        return content
+    from gateway.message_timestamps import render_user_content_with_timestamp
+
+    rendered = render_user_content_with_timestamp(content, timestamp, tz=tz)
+    return f"{gap_line}\n{rendered}" if gap_line else rendered
+
+
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
@@ -1193,7 +1323,8 @@ def build_api_messages(
     prologue). Ephemeral context (prefetch, ``pre_llm_call`` hooks,
     ``ephemeral_system_prompt``) is added at API time only — ``messages`` stays untouched
     beyond the sidecar stamp, and the system prompt is built ONCE per session and
-    replayed verbatim."""
+    replayed verbatim. A Bot Chat's per-message time prefix and gap line are wire-only for
+    the same reason (see ``_render_bot_chat_user_content``)."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
@@ -1213,6 +1344,22 @@ def build_api_messages(
     turn_now = agent._current_turn_timestamp
     split = current_turn_user_idx if has_current else 0
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
+
+    # Bot Chat per-message local time (bot chats only; see _bot_chat_time_enabled): every user
+    # row on the wire carries a prefix built from its own stored timestamp, and THIS turn's new
+    # user message also carries a gap line when the previous one is old. Resolved once per call,
+    # before the loop, so all rows of one request share one zone.
+    bot_chat_time = _bot_chat_time_enabled(agent)
+    bot_chat_tz = None
+    bot_chat_gap_line = ""
+    if bot_chat_time:
+        from hermes_time import get_timezone as _get_bot_chat_tz
+
+        bot_chat_tz = _get_bot_chat_tz()
+        if has_current and current_turn_message.get("role") == "user":
+            bot_chat_gap_line = _bot_chat_current_turn_gap_line(
+                canonical_messages[:split], current_turn_message
+            )
 
     api_messages = []
     for idx, msg in enumerate(canonical_messages):
@@ -1250,6 +1397,18 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+
+        # Bot Chat local time, AFTER the substitution above (a prefix applied before it would
+        # be overwritten by the row's sidecar, leaving every older message unprefixed). Wire
+        # copy only: neither the durable row nor its api_content sidecar ever carries this
+        # prefix, and the bytes come from the row's stored timestamp, so repeated assemblies
+        # of the same transcript are identical.
+        if bot_chat_time and api_msg.get("role") == "user":
+            api_msg["content"] = _render_bot_chat_user_content(
+                api_msg.get("content"), msg.get("timestamp"),
+                gap_line=bot_chat_gap_line if msg is current_turn_message else "",
+                tz=bot_chat_tz,
+            )
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

@@ -716,6 +716,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 clear_skills_system_prompt_cache(clear_snapshot=True)
             except Exception:
                 pass
+            # The protocol section is cached per (process, home) too (``bot_mode_probe._cached``),
+            # and the rebuild below reaches it through that cache. Without this refresh a
+            # protocol_version bump stamps the NEW epoch onto the OLD section text: the staleness
+            # check then reports clean forever and the new lines never reach the bot. Refresh
+            # through the SAME home the build resolves, so the cache the build reads is the one
+            # cleared here.
+            try:
+                from agent.system_prompt import _agent_home
+                from tools.bot_mode_probe import get_bot_mode_protocol_section
+                get_bot_mode_protocol_section(_agent_home(agent), force_refresh=True)
+            except Exception:
+                pass
             agent._cached_system_prompt = agent._build_system_prompt(system_message)
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is

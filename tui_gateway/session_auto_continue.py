@@ -114,10 +114,15 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with _session_profile_runtime_scope(session):
                 def announce():
                     _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
-                    _emit("message.start", sid)
                 render_notification(announce, platform="tui", diagnostic=diagnostic)
-                _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+                # No turn-start frame here: the admitted turn emits it, so a refused continuation
+                # cannot leave the client showing work that never runs.
+                started = _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+                if started is False:
+                    _notif_release_turn(session)
+                    with session["history_lock"]:
+                        session["_auto_continue_scheduled"] = False
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)
             _notif_release_turn(session)  # rebound from session_notifications

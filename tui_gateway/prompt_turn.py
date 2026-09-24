@@ -414,11 +414,25 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
                             on_done=None, on_error=None) -> None:
-    """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
-    release ``running``."""
+    """Chain one follow-up turn (caller set ``running``); on failure or refusal run ``on_error``,
+    log, release ``running``.
+
+    No turn-start frame is emitted here: ``_run_prompt_submit`` emits it once the turn is admitted,
+    and a frame sent before admission is what leaves a refused turn showing "the agent is working"
+    forever (the client latches busy on that frame, and a refusal runs no turn to send its end).
+    """
     try:
-        _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        started = _run_prompt_submit(rid, sid, session, prompt)
+        if started is False:
+            # A refusal is a follow-up that never ran, and the caller claimed ``running`` for it.
+            # ``_admit_prompt_turn`` clears the flag; this only keeps the same contract as the
+            # exception path below for a refusal that came from anywhere else.
+            if on_error is not None:
+                on_error()
+            _hook_failure(what, RuntimeError("follow-up turn refused"))
+            with session["history_lock"]:
+                session["running"] = False
+            return
         if on_done is not None:
             on_done()
     except Exception as exc:

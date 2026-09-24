@@ -1929,6 +1929,16 @@ DEFAULT_CONFIG = {
         # before failing with a structured 'target_busy' error. Deliveries are serialized per
         # profile with a cross-process file lock.
         "turn_wait_seconds": 120,
+        # Prefix each user message IN A BOT CHAT'S MODEL CONTEXT with its own local send time
+        # ("[Tue 2026-04-28 13:40:53 CEST]"), plus a "[Gap: 6h 12m since the previous message]"
+        # line on the current turn's message when the previous user message is 4h or older. Bot
+        # chats ONLY, and off everywhere else: a Bot Chat's system prompt is deliberately
+        # timeless, so this is the only clock signal it gets. Rendered in the shared request
+        # assembly (agent/turn_context.py) from each row's STORED timestamp — never the current
+        # clock — so request bytes stay byte-stable and the prompt cache still hits, and stored
+        # transcripts never carry the prefix. This key is the desktop/TUI read site; the
+        # gateway's own `gateway.message_timestamps.enabled` (also default off) is unrelated.
+        "message_timestamps": {"enabled": False},
     },
     "code_execution": {  # execute_code settings (programmatic tool calls).
         # project = run in the session cwd with the active venv/conda python so project deps and
