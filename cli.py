@@ -1007,14 +1007,18 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         skills_prompt, loaded_skills, missing_skills = result
         if missing_skills:
             missing_display = ", ".join(missing_skills)
-            # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
-            if loaded_skills:
+            # A typo'd name must not crash a kanban worker; only a fully-missing set fails
+            # loudly. The dispatcher force-loads tasks.skills verbatim (kanban_db_dispatch
+            # _worker_argv), so a profile that lacks EVERY requested name would otherwise
+            # kill the run twice and park the card at gave_up. For a dispatcher-owned
+            # worker (HERMES_KANBAN_TASK) skip and warn instead of raising.
+            if loaded_skills or os.environ.get("HERMES_KANBAN_TASK"):
                 logger.warning(
                     "Unknown skill(s) requested, skipping: %s. "
                     "Continuing with: %s. "
                     "List available skills with `hermes skills list`.",
                     missing_display,
-                    ", ".join(loaded_skills),
+                    ", ".join(loaded_skills) or "(none)",
                 )
             else:
                 raise ValueError(f"Unknown skill(s): {missing_display}")

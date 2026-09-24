@@ -715,3 +715,83 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+def _decomposed_graph(conn, children: list[dict], *, title: str = "ship the feature"):
+    """``root -> children`` exactly as the decomposer builds them: children start
+    in ``todo``, then promote into the ready lane when their parents finish."""
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+
+    root = kb.create_task(conn, title=title, triage=True)
+    child_ids = decompose_triage_task(
+        conn, root, root_assignee="orchestrator", children=children, author="decomposer",
+    )
+    assert child_ids is not None
+    return child_ids
+
+
+def test_decomposed_review_child_returns_findings_from_the_ready_lane(conn) -> None:
+    """A review child the decomposer marked ``role="review"`` is dispatched as an
+    ordinary ready card, so its reviewer run was never claimed from ``review``.
+    Its findings must still reach the implementer instead of dead-ending in a
+    block, which is how two reviewers on this board lost the routing."""
+    implementation, review = _decomposed_graph(conn, [
+        {"title": "implement it", "assignee": "builder", "parents": []},
+        {"title": "review it", "assignee": "reviewer", "parents": [0], "role": "review"},
+    ])
+    kb.recompute_ready(conn)
+    run = kb.claim_task(conn, implementation, claimer="builder:1")
+    assert run is not None
+    assert kb.complete_task(
+        conn, implementation, summary="implemented", expected_run_id=run.current_run_id,
+    )
+
+    kb.recompute_ready(conn)
+    assert kb.get_task(conn, review).status == "ready"
+    claimed = kb.claim_task(conn, review, claimer="reviewer:1")
+    assert claimed is not None
+
+    assert kb.request_changes(
+        conn, review, reason="The export path drops the last row.",
+        expected_run_id=claimed.current_run_id,
+    ) == (True, "builder")
+
+    rework = kb.get_task(conn, review)
+    assert rework is not None
+    assert (rework.status, rework.assignee) == ("ready", "builder")
+    changes = _event(kb.list_events(conn, review), "changes_requested")
+    assert changes.payload["implementer"] == "builder"
+    assert changes.payload["reviewer"] == "reviewer"
+    # Only the review card moved: the implementation it verified stays done.
+    assert kb.get_task(conn, implementation).status == "done"
+
+
+def test_review_verdict_still_refuses_an_ordinary_worker_run(conn) -> None:
+    """The verdict gate is keyed on review provenance, not on the lane a card
+    happens to run in: a plain ready card and an unmarked decomposed child both
+    refuse, so an ordinary worker still cannot send its own card back."""
+    plain = kb.create_task(conn, title="plain implementation", assignee="builder")
+    claimed = kb.claim_task(conn, plain, claimer="builder:1")
+    assert claimed is not None
+    assert kb.request_changes(
+        conn, plain, reason="not a review run", expected_run_id=claimed.current_run_id,
+    ) == (False, "active run was not claimed from review")
+    assert kb.get_task(conn, plain).status == "running"
+
+    first, second = _decomposed_graph(conn, [
+        {"title": "research", "assignee": "analyst", "parents": []},
+        {"title": "build", "assignee": "builder", "parents": [0]},
+    ], title="feature")
+    kb.recompute_ready(conn)
+    first_run = kb.claim_task(conn, first, claimer="analyst:1")
+    assert first_run is not None
+    assert kb.complete_task(
+        conn, first, summary="researched", expected_run_id=first_run.current_run_id,
+    )
+    kb.recompute_ready(conn)
+    second_run = kb.claim_task(conn, second, claimer="builder:1")
+    assert second_run is not None
+    assert kb.request_changes(
+        conn, second, reason="not a review run", expected_run_id=second_run.current_run_id,
+    ) == (False, "active run was not claimed from review")
+    assert kb.get_task(conn, second).status == "running"

@@ -90,5 +90,54 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def _created_payload(conn, task_id: str) -> dict:
+    return [ev for ev in kb.list_events(conn, task_id) if ev.kind == "created"][0].payload
+
+
+def test_decompose_records_a_review_child_and_its_implementer(kanban_home):
+    """Only the decomposer knows a child verifies another child's work, so it
+    records that role (and the single profile its findings route back to) on the
+    child's ``created`` event — the provenance ``request_changes`` reads."""
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="ship it")
+        child_ids = decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "build it", "assignee": "engineer", "parents": []},
+                {"title": "review it", "assignee": "reviewer", "parents": [0], "role": "review"},
+            ],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kbc.connect() as conn:
+        build, review = _created_payload(conn, child_ids[0]), _created_payload(conn, child_ids[1])
+
+    assert "role" not in build  # implementation work stays unmarked
+    assert review["role"] == "review"
+    assert review["implementer"] == "engineer"
+
+    # Two distinct implementers: no single owner to route back to, so nothing is
+    # recorded and the reviewer's verdict refuses instead of misrouting.
+    with kbc.connect() as conn:
+        tid2 = _create_triage(conn, title="mixed review")
+        ids2 = decompose_triage_task(
+            conn,
+            tid2,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "a", "assignee": "alice", "parents": []},
+                {"title": "b", "assignee": "bob", "parents": []},
+                {"title": "review both", "assignee": "reviewer", "parents": [0, 1], "role": "review"},
+            ],
+            author="decomposer",
+        )
+        mixed = _created_payload(conn, ids2[2])
+
+    assert mixed["role"] == "review"
+    assert "implementer" not in mixed
+
+
 
 

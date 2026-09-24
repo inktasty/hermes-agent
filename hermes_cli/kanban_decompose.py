@@ -55,7 +55,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "role": "implementation" | "review"
       },
       ...
     ]
@@ -65,6 +66,12 @@ Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
+  - "role" is optional and defaults to "implementation". Use "review" for
+    the ONE child whose job is to independently verify another child's
+    deliverable instead of producing work of its own (a review/QA card);
+    list the implementation task(s) it verifies in its "parents". Marking
+    that child "review" is what lets its findings route back to the
+    implementer instead of dead-ending in a block.
   - Prefer parallelism. If two tasks can be done independently, give
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
@@ -261,12 +268,16 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
+        role = entry.get("role")
         children.append({
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
+            # Only the documented review role survives; anything else (including
+            # a missing or garbled field) means plain implementation work.
+            "role": "review" if isinstance(role, str) and role.strip().lower() == "review" else None,
         })
     return children, ""
 

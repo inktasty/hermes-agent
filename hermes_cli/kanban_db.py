@@ -3492,12 +3492,33 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _decomposed_review_child(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[bool, Optional[str]]:
+    """``(is_review_child, implementer)`` for a card the decomposer created to
+    review a sibling's work.
+
+    A decomposed review child is dispatched as an ordinary ready card, so its
+    run was never claimed from ``review``; the ``role`` marker the decompose
+    flow writes on the ``created`` event is what makes that run a review run.
+    Anything without the marker is an ordinary card. ``implementer`` is ``None``
+    when the decomposition could not name a single profile to route back to.
+    """
+    payload = _json_dict(_row_get(_latest_event(conn, task_id, "created"), "payload"))
+    if payload.get("role") != "review":
+        return False, None
+    return True, _nonblank_str(payload.get("implementer"))
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Close an active reviewer run (claimed from ``review``) and hand the task
-    back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    """Close an active reviewer run and hand the task back to the implementer,
+    parent gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    The implementer comes from the latest ``review_requested`` event for a run
+    claimed from ``review``, or from the decompose flow's ``role`` marker for a
+    review child dispatched in the ready lane; any other run is refused."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3516,13 +3537,21 @@ def request_changes(
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
-        if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
-
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        if claimed_payload.get("source_status") == "review":
+            requested_event = _latest_event(conn, task_id, "review_requested")
+            if requested_event is None:
+                return False, "no prior review_requested event"
+            implementer = _nonblank_str(
+                _json_dict(requested_event["payload"]).get("implementer"),
+            )
+        else:
+            # A decomposed review child (the decomposer marked one of its
+            # children ``review``) is dispatched in the ready lane, so its run
+            # was never claimed from ``review``. That marker is the provenance
+            # which makes the run a review run; every other run keeps the gate.
+            is_review_child, implementer = _decomposed_review_child(conn, task_id)
+            if not is_review_child:
+                return False, "active run was not claimed from review"
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))

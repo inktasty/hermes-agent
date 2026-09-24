@@ -132,14 +132,18 @@ def _build_preloaded_skills_prompt(skills: object = None) -> str | None:
     skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(parsed_skills)
     if missing_skills:
         missing_display = ", ".join(missing_skills)
-        if not loaded_skills:
+        # Same contract as cli.py: a fully-missing set fails loudly for a human, but a
+        # dispatcher-owned worker (HERMES_KANBAN_TASK) must never die for a skill name —
+        # the board would burn its retry budget and park a card that could have run.
+        if loaded_skills or os.environ.get("HERMES_KANBAN_TASK"):
+            logging.warning(
+                "Unknown skill(s) requested, skipping: %s. Continuing with: %s. "
+                "List available skills with `hermes skills list`.",
+                missing_display,
+                ", ".join(loaded_skills) or "(none)",
+            )
+        else:
             raise ValueError(f"Unknown skill(s): {missing_display}")
-        logging.warning(
-            "Unknown skill(s) requested, skipping: %s. Continuing with: %s. "
-            "List available skills with `hermes skills list`.",
-            missing_display,
-            ", ".join(loaded_skills),
-        )
     return skills_prompt or None
 
 

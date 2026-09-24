@@ -87,6 +87,32 @@ def _validate_children_graph(children: list) -> None:
         raise ValueError("cyclic dependency detected in decomposed children list")
 
 
+def _review_child_implementer(children: list, idx: int) -> Optional[str]:
+    """Profile a decomposed review child routes its findings back to, or ``None``.
+
+    A child the decomposer marked ``role="review"`` verifies its dependency
+    parents' work, so those parents' assignee is the implementer. With no
+    declared parents every non-review sibling counts. Exactly one distinct
+    profile is required: an absent or ambiguous answer stays ``None`` and
+    ``request_changes`` refuses rather than misrouting the finding.
+    """
+    from hermes_cli.kanban_db import _canonical_assignee
+
+    child = children[idx]
+    if child.get("role") != "review":
+        return None
+    parents = [p for p in (child.get("parents") or []) if 0 <= p < len(children)]
+    if parents:
+        # A parent that is itself a review child is not an implementer.
+        sources = [children[p] for p in parents if children[p].get("role") != "review"]
+    else:
+        sources = [
+            other for i, other in enumerate(children) if i != idx and other.get("role") != "review"
+        ]
+    names = {name for other in sources if (name := _canonical_assignee(other.get("assignee")))}
+    return names.pop() if len(names) == 1 else None
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
@@ -128,8 +154,11 @@ def decompose_triage_task(
         ).fetchone():
             return None
         child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
-            for child in children
+            _insert_decomposed_child(
+                conn, task_id, root_row, children[idx], author, now,
+                implementer=_review_child_implementer(children, idx),
+            )
+            for idx in range(len(children))
         ]
         # Sibling edges within the decomposed graph.
         for idx, child in enumerate(children):
@@ -168,10 +197,16 @@ def decompose_triage_task(
 
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
+    author: Optional[str], now: int, *, implementer: Optional[str] = None,
 ) -> str:
     """Insert one decomposed child as ``todo`` (linked under the root later so
     the dispatcher only ever sees a coherent graph); returns its id.
+
+    ``implementer`` is set only for a review child (see
+    :func:`_review_child_implementer`) and is recorded on the ``created`` event
+    with the ``role`` marker: the decompose flow is the one component that knows
+    a child verifies another child's work, and the marker is what lets that
+    child's reviewer return findings instead of dead-ending in a block.
 
     Workspace: per-child override wins, else inherit the root's kind. Path
     inherits only when kinds match (a 'dir' child must not point at the
@@ -207,8 +242,11 @@ def _insert_decomposed_child(
             root_row["tenant"], now, (author or "decomposer"),
         ),
     )
-    _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
-    )
+    created_payload: dict[str, Any] = {"by": author or "decomposer", "from_decompose_of": root_id}
+    if child.get("role") == "review":
+        created_payload["role"] = "review"
+        if implementer:
+            created_payload["implementer"] = implementer
+    _append_event(conn, new_id, "created", created_payload)
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

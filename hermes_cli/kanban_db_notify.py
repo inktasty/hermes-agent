@@ -327,9 +327,15 @@ def unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    max_event_id: Optional[int] = None,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` with ``id > last_event_id``. The cursor
     is NOT advanced here; call :func:`advance_notify_cursor` after delivery.
+
+    ``max_event_id`` caps the ids returned (``id <= max_event_id``), which is
+    what lets a kind-filtered claim stop at a given event instead of stepping
+    over the events of other kinds sitting below the highest id it matched —
+    see :func:`claim_unseen_events_for_sub_bounded`.
     """
     cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
     if cursor is None:
@@ -338,11 +344,14 @@ def unseen_events_for_sub(
     q = (
         "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
         + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+        + ("AND id <= ? " if max_event_id is not None else "")
         + "ORDER BY id ASC"
     )
     params: list[Any] = [task_id, cursor]
     if kind_list:
         params.extend(kind_list)
+    if max_event_id is not None:
+        params.append(int(max_event_id))
     rows = conn.execute(q, params).fetchall()
     out = [_kb.Event.from_row(r) for r in rows]
     max_id = max([cursor, *(int(r["id"]) for r in rows)])
@@ -374,6 +383,45 @@ def claim_unseen_events_for_sub(
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
+        )
+        if not events:
+            return old_cursor, old_cursor, []
+        _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
+        return old_cursor, new_cursor, events
+
+
+def claim_unseen_events_for_sub_bounded(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+    max_event_id: int,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen events of ``kinds`` up to ``max_event_id``.
+
+    Same contract as :func:`claim_unseen_events_for_sub` — ``(old_cursor,
+    new_cursor, events)`` with the row advanced inside one ``BEGIN IMMEDIATE``
+    — plus a hard cap on the ids it can return. Because the cap is part of the
+    claim, ``new_cursor`` is always the cursor the row holds afterwards and is
+    ``<= max_event_id``: the claim can never retire an event above the cap,
+    which the unbounded kind-filtered claim would, since it reports ``max(id
+    of the rows it returned)``. A caller delivering one kind-filtered run
+    therefore needs no second cursor move to put the rest back — and no window
+    in which a concurrent consumer can move the row out from under that move.
+
+    Delivery failure is undone with :func:`force_rewind_notify_cursor`
+    (``claimed_cursor=new_cursor, old_cursor=old_cursor``).
+    """
+    with _kb.write_txn(conn):
+        old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
+        if old_cursor is None:
+            return 0, 0, []
+        new_cursor, events = unseen_events_for_sub(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, kinds=kinds, max_event_id=max_event_id,
         )
         if not events:
             return old_cursor, old_cursor, []
@@ -433,6 +481,41 @@ def rewind_notify_cursor(
     """
     with _kb.write_txn(conn):
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
+    return cur.rowcount > 0
+
+
+def force_rewind_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    """Undo a claim whose events were never delivered, even if the row moved since.
+
+    :func:`rewind_notify_cursor` is CAS-guarded against the claim's own value
+    and so declines as soon as another consumer advanced the row — right for a
+    notifier that must not clobber newer progress, wrong for a claim whose
+    events were never sent: that advance retires them behind a cursor no later
+    tick reads past. Here the row's current cursor is read inside the same
+    ``BEGIN IMMEDIATE`` and the rewind CASes against THAT value, so the
+    undelivered range ``(old_cursor, claimed_cursor]`` becomes claimable again
+    and the next tick retries it. Re-delivering a range a concurrent consumer
+    claimed in between is the accepted price: at-least-once over silent loss.
+
+    Returns whether the row was moved. ``False`` when the subscription is gone
+    (nothing to rewind), when the row already sits at or below ``old_cursor``
+    (nothing owed) or below ``claimed_cursor`` (another consumer already put it
+    back, so the events are claimable without help).
+    """
+    with _kb.write_txn(conn):
+        current = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
+        if current is None or current == old_cursor or current < claimed_cursor:
+            return False
+        cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, current)
     return cur.rowcount > 0
 
 
