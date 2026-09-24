@@ -15,6 +15,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -29,6 +30,14 @@ from hermes_state import SessionDB
 
 _NOW_DT = datetime(2026, 9, 22, 20, 0, 0, tzinfo=timezone.utc)
 _NOW = _NOW_DT.timestamp()
+
+# Every timestamp assertion in this file is pinned to this zone, never the process-local one.
+# The code under test renders in the Hermes-configured zone (``hermes_time.get_timezone()``), so
+# the fixture writes this name into the temp-home config and the expected strings pass the same
+# zone to ``format_message_timestamp`` explicitly. Without the pin the two sides disagree on any
+# box whose process TZ differs from the configured zone.
+_PINNED_TZ_NAME = "UTC"
+_PINNED_TZ = ZoneInfo(_PINNED_TZ_NAME)
 
 
 class _Agent:
@@ -63,14 +72,23 @@ def _agent(*, timestamp=_NOW, title="Bot Chat"):
 
 @pytest.fixture
 def bot_chat_time_config():
-    """``bot_mode.message_timestamps.enabled: true`` in the active (per-test temp) home."""
+    """``bot_mode.message_timestamps.enabled: true`` in the active (per-test temp) home, plus an
+    explicit ``timezone`` so the code under test renders in a pinned zone (``_PINNED_TZ``) rather
+    than whatever the process happens to be running in."""
     from hermes_constants import get_config_path
 
     config_path = get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
-        "bot_mode:\n  message_timestamps:\n    enabled: true\n", encoding="utf-8"
+        "bot_mode:\n  message_timestamps:\n    enabled: true\n"
+        f"timezone: {_PINNED_TZ_NAME}\n",
+        encoding="utf-8",
     )
+    # hermes_time caches the resolved zone per config source; drop any entry so the value just
+    # written is the one the code under test resolves.
+    import hermes_time
+
+    hermes_time.reset_cache()
     return config_path
 
 
@@ -111,7 +129,7 @@ def test_prefix_comes_from_the_rows_own_stored_timestamp(bot_chat_time_config):
 
     wire_user = _user_rows(_assemble(_agent(), history))[0]
 
-    assert wire_user["content"] == f"{format_message_timestamp(stored_ts)} hello there"
+    assert wire_user["content"] == f"{format_message_timestamp(stored_ts, tz=_PINNED_TZ)} hello there"
     # The durable row is untouched: no prefix there, and no sidecar was invented.
     assert history[0]["content"] == "hello there"
     assert "api_content" not in history[0]
@@ -129,7 +147,7 @@ def test_historical_rows_are_prefixed_after_the_sidecar_substitution(bot_chat_ti
 
     wire_user = _user_rows(_assemble(_agent(), history))[0]
 
-    assert wire_user["content"] == f"{format_message_timestamp(stored_ts)} clean text [with memory]"
+    assert wire_user["content"] == f"{format_message_timestamp(stored_ts, tz=_PINNED_TZ)} clean text [with memory]"
     # The sidecar itself is the durable copy and stays clean.
     assert history[0]["api_content"] == "clean text [with memory]"
 
@@ -137,7 +155,7 @@ def test_historical_rows_are_prefixed_after_the_sidecar_substitution(bot_chat_ti
 def test_an_existing_prefix_is_stripped_not_doubled(bot_chat_time_config):
     """A messaging surface that already stamped the row keeps its embedded time, rendered once."""
     stored_ts = _hour_before(3)
-    stamped = f"{format_message_timestamp(stored_ts)} routed in from telegram"
+    stamped = f"{format_message_timestamp(stored_ts, tz=_PINNED_TZ)} routed in from telegram"
     history = [{"role": "user", "content": stamped, "timestamp": stored_ts}]
 
     wire_user = _user_rows(_assemble(_agent(), history))[0]
@@ -201,9 +219,9 @@ def test_gap_line_after_a_long_silence_and_only_then(bot_chat_time_config):
 
     assert with_gap == (
         "[Gap: 6h since the previous message]\n"
-        f"{format_message_timestamp(_NOW)} new question"
+        f"{format_message_timestamp(_NOW, tz=_PINNED_TZ)} new question"
     )
-    assert without_gap == f"{format_message_timestamp(_NOW)} new question"
+    assert without_gap == f"{format_message_timestamp(_NOW, tz=_PINNED_TZ)} new question"
 
 
 def test_gap_line_appears_only_on_the_current_turn(bot_chat_time_config):
@@ -226,7 +244,7 @@ def test_no_gap_line_on_the_first_message_of_a_chat(bot_chat_time_config):
     wire_user = _user_rows(_assemble(_agent(), history))[0]
 
     assert "Gap:" not in wire_user["content"]
-    assert wire_user["content"] == f"{format_message_timestamp(_NOW)} hello for the first time"
+    assert wire_user["content"] == f"{format_message_timestamp(_NOW, tz=_PINNED_TZ)} hello for the first time"
 
 
 def test_gap_line_bytes_are_identical_across_two_assemblies(bot_chat_time_config):
